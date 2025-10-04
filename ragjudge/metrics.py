@@ -1692,6 +1692,863 @@ class FaithfulnessNLI(Metric):
                 return i
         return None
 
+class ContextPrecisionAtK(Metric):
+    """
+    Context Precision@k (label-based).
+
+    Measures precision among top-k retrieved contexts using provided relevance labels.
+
+    Labels:
+      - Preferred graded: sample[rel_field] = {doc_id: rel}, rel>0 => relevant
+      - Fallback binary:  sample[binary_fallback_field] = iterable of relevant IDs
+
+    Config:
+      - k: int | None (None => use full retrieved length)
+      - rel_field: str = "relevance"
+      - binary_fallback_field: str = "reference_docs"
+      - retrieved_field: str = "retrieved_docs"
+      - dedup: bool = True
+
+    Returns:
+      { f"context_precision@{k_str}": float in [0,1] or None }.
+      None when no relevance labels are available.
+    """
+    name = "context_precision_at_k"
+
+    def __init__(
+        self,
+        k: int | None = 5,
+        *,
+        rel_field: str = "relevance",
+        binary_fallback_field: str = "reference_docs",
+        retrieved_field: str = "retrieved_docs",
+        dedup: bool = True,
+    ) -> None:
+        if k is not None and k <= 0:
+            raise ValueError("k must be positive or None.")
+        self.k = k
+        self.rel_field = rel_field
+        self.binary_fallback_field = binary_fallback_field
+        self.retrieved_field = retrieved_field
+        self.dedup = dedup
+
+    def compute(self, sample: Dict[str, Any]) -> Dict[str, Any]:
+        relevant = self._relevant_set(sample)
+        if relevant is None:
+            return {self._key(): None}
+
+        ranked = _as_ranked_list(sample.get(self.retrieved_field, []))
+        retrieved_ids = _ranked_to_ids(ranked, dedup=self.dedup)
+        if not retrieved_ids:
+            return {self._key(): None}
+
+        k_cut = len(retrieved_ids) if self.k is None else self.k
+        topk = retrieved_ids[:k_cut]
+        hits = sum(1 for d in topk if d in relevant)
+        prec = hits / max(1, len(topk))
+        return {self._key(): prec}
+
+    def _relevant_set(self, sample: Dict[str, Any]) -> Set[Doc] | None:
+        graded = sample.get(self.rel_field)
+        if isinstance(graded, dict) and graded:
+            rel = {k for k, v in graded.items() if self._is_pos(v)}
+            if rel:
+                return rel
+        gold_ids = _as_id_set(sample.get(self.binary_fallback_field, []))
+        return gold_ids if gold_ids else None
+
+    @staticmethod
+    def _is_pos(v: Any) -> bool:
+        try:
+            return float(v) > 0.0
+        except Exception:
+            return False
+
+    def _key(self) -> str:
+        return f"context_precision@{'all' if self.k is None else self.k}"
+
+
+class ContextPrecisionSim(Metric):
+    """
+    Context Precision@k (similarity-based).
+
+    Measures precision among top-k retrieved contexts using cosine(question, doc).
+    A doc is relevant if cosine >= threshold.
+
+    Inputs:
+      - question_embedding_field: sample[question_embedding_field] -> List[float]
+      - doc_embedding_field:      sample[doc_embedding_field] -> Dict[doc_id, List[float]]
+      - If embeddings missing and `embedder` is provided, will try to embed from text:
+          * question_field (str)
+          * doc_text_field: Dict[doc_id, str or List[str]] -> we embed the doc text (str) or join list.
+
+    Config:
+      - k: int | None (None => use full retrieved length)
+      - threshold: float in [-1,1], default 0.3
+      - agg_doc: "mean" | "max"  (when doc_text provides List[str], how to aggregate multiple chunks; default "max")
+      - retrieved_field: str = "retrieved_docs"
+      - question_field: str = "question"
+      - doc_text_field: str = "doc_text"
+      - question_embedding_field: str = "question_embedding"
+      - doc_embedding_field: str = "doc_embedding"
+      - embedder: Optional[callable] converting str or List[str] -> vector(s)
+      - l2_normalize: bool = True
+      - dedup: bool = True
+
+    Returns:
+      { f"context_precision_sim@{k_str}": float in [0,1] or None }.
+      None when embeddings/texts are insufficient.
+    """
+    name = "context_precision_sim"
+
+    def __init__(
+        self,
+        k: int | None = 5,
+        *,
+        threshold: float = 0.3,
+        agg_doc: str = "max",
+        retrieved_field: str = "retrieved_docs",
+        question_field: str = "question",
+        doc_text_field: str = "doc_text",
+        question_embedding_field: str = "question_embedding",
+        doc_embedding_field: str = "doc_embedding",
+        embedder: Any | None = None,
+        l2_normalize: bool = True,
+        dedup: bool = True,
+    ) -> None:
+        if k is not None and k <= 0:
+            raise ValueError("k must be positive or None.")
+        if agg_doc not in {"mean", "max"}:
+            raise ValueError('agg_doc must be one of {"mean","max"}')
+        self.k = k
+        self.threshold = float(threshold)
+        self.agg_doc = agg_doc
+        self.retrieved_field = retrieved_field
+        self.question_field = question_field
+        self.doc_text_field = doc_text_field
+        self.question_embedding_field = question_embedding_field
+        self.doc_embedding_field = doc_embedding_field
+        self.embedder = embedder
+        self.l2_normalize = l2_normalize
+        self.dedup = dedup
+
+    def compute(self, sample: Dict[str, Any]) -> Dict[str, Any]:
+        q = self._get_question_vec(sample)
+        if q is None:
+            return {self._key(): None, "context_prec_error": "no question embedding and no usable embedder"}
+
+        # 拿 top-k doc embeddings（必要時用 embedder 對文本向量化）
+        ranked = _as_ranked_list(sample.get(self.retrieved_field, []))
+        doc_ids = _ranked_to_ids(ranked, dedup=self.dedup)
+        if not doc_ids:
+            return {self._key(): None}
+        k_cut = len(doc_ids) if self.k is None else self.k
+        doc_ids = doc_ids[:k_cut]
+
+        doc_emb_map = sample.get(self.doc_embedding_field, {}) or {}
+        sims: List[float] = []
+        for did in doc_ids:
+            vec = doc_emb_map.get(did)
+            if isinstance(vec, list) and vec:
+                sims.append(self._cos(q, vec))
+                continue
+
+            # 沒有 doc 向量：嘗試從文本計算（需要 embedder）
+            if self.embedder is None:
+                continue
+            doc_text = sample.get(self.doc_text_field, {}).get(did) if isinstance(sample.get(self.doc_text_field), dict) else None
+            if isinstance(doc_text, str):
+                v = self._embed_one(doc_text)
+                if v is not None:
+                    sims.append(self._cos(q, v))
+            elif isinstance(doc_text, (list, tuple)):
+                # 多段文本 → 先各自嵌入，再依 agg_doc 聚合成單一分數
+                segs = [t for t in doc_text if isinstance(t, str) and t.strip()]
+                vecs = self._embed_many(segs) if segs else []
+                if vecs:
+                    seg_sims = [self._cos(q, v) for v in vecs]
+                    agg = max(seg_sims) if self.agg_doc == "max" else (sum(seg_sims)/len(seg_sims))
+                    sims.append(agg)
+
+        if not sims:
+            return {self._key(): None, "context_prec_error": "no usable doc embeddings/texts"}
+
+        hits = sum(1 for s in sims if s >= self.threshold)
+        prec = hits / max(1, len(sims))
+        return {self._key(): float(prec)}
+
+    # ------------------------ helpers ------------------------
+
+    def _key(self) -> str:
+        return f"context_precision_sim@{'all' if self.k is None else self.k}"
+
+    def _cos(self, a: List[float], b: List[float]) -> float:
+        if self.l2_normalize:
+            a = self._l2(a); b = self._l2(b)
+        try:
+            return _cosine_sim(a, b)  # 若前面已定義共用 cosine
+        except NameError:
+            dot = sum(x*y for x, y in zip(a, b))
+            na = sum(x*x for x in a) ** 0.5
+            nb = sum(y*y for y in b) ** 0.5
+            return 0.0 if na == 0.0 or nb == 0.0 else dot / (na * nb)
+
+    @staticmethod
+    def _l2(v: List[float]) -> List[float]:
+        import math
+        n = math.sqrt(sum(x*x for x in v)) or 1.0
+        return [x / n for x in v]
+
+    def _get_question_vec(self, sample: Dict[str, Any]) -> List[float] | None:
+        vec = sample.get(self.question_embedding_field)
+        if isinstance(vec, list) and vec:
+            return vec
+        if self.embedder is not None:
+            text = sample.get(self.question_field)
+            if isinstance(text, str):
+                return self._embed_one(text)
+        return None
+
+    # ---- embedder adapters ----
+    def _embed_one(self, text: str) -> List[float] | None:
+        try:
+            v = self.embedder(text)  # type: ignore
+            if isinstance(v, list):
+                return [float(x) for x in v]
+            if hasattr(v, "__iter__"):
+                return [float(x) for x in list(v)]
+        except Exception:
+            return None
+        return None
+
+    def _embed_many(self, texts: List[str]) -> List[List[float]]:
+        try:
+            v = self.embedder(texts)  # type: ignore
+            if isinstance(v, list) and v and isinstance(v[0], list):
+                return [[float(x) for x in vec] for vec in v]
+        except Exception:
+            outs: List[List[float]] = []
+            for t in texts:
+                vt = self._embed_one(t)
+                if vt is not None:
+                    outs.append(vt)
+            return outs
+        return []
+
+class ContextRecallAtK(Metric):
+    """
+    Context Recall@k (label-based).
+
+    Uses provided relevance labels to compute recall among top-k retrieved docs.
+
+    Labels:
+      - Preferred graded: sample[rel_field] = {doc_id: rel}, rel>0 => relevant
+      - Fallback binary:  sample[binary_fallback_field] = iterable of relevant IDs
+
+    Config:
+      - k: int | None (None => use full retrieved length)
+      - rel_field: str = "relevance"
+      - binary_fallback_field: str = "reference_docs"
+      - retrieved_field: str = "retrieved_docs"
+      - dedup: bool = True
+
+    Returns:
+      { f"context_recall@{k_str}": float in [0,1] or None }.
+      None when no relevance labels are available.
+    """
+    name = "context_recall_at_k"
+
+    def __init__(
+        self,
+        k: int | None = 5,
+        *,
+        rel_field: str = "relevance",
+        binary_fallback_field: str = "reference_docs",
+        retrieved_field: str = "retrieved_docs",
+        dedup: bool = True,
+    ) -> None:
+        if k is not None and k <= 0:
+            raise ValueError("k must be positive or None.")
+        self.k = k
+        self.rel_field = rel_field
+        self.binary_fallback_field = binary_fallback_field
+        self.retrieved_field = retrieved_field
+        self.dedup = dedup
+
+    def compute(self, sample: Dict[str, Any]) -> Dict[str, Any]:
+        relevant = self._relevant_set(sample)
+        if not relevant:
+            return {self._key(): None}
+
+        ranked = _as_ranked_list(sample.get(self.retrieved_field, []))
+        retrieved_ids = _ranked_to_ids(ranked, dedup=self.dedup)
+        if not retrieved_ids:
+            return {self._key(): None}
+
+        k_cut = len(retrieved_ids) if self.k is None else self.k
+        topk = retrieved_ids[:k_cut]
+
+        hits = sum(1 for d in topk if d in relevant)
+        rec = hits / max(1, len(relevant))
+        return {self._key(): rec}
+
+    def _relevant_set(self, sample: Dict[str, Any]) -> Set[Doc] | None:
+        graded = sample.get(self.rel_field)
+        if isinstance(graded, dict) and graded:
+            rel = {k for k, v in graded.items() if self._is_pos(v)}
+            if rel:
+                return rel
+        gold_ids = _as_id_set(sample.get(self.binary_fallback_field, []))
+        return gold_ids if gold_ids else None
+
+    @staticmethod
+    def _is_pos(v: Any) -> bool:
+        try:
+            return float(v) > 0.0
+        except Exception:
+            return False
+
+    def _key(self) -> str:
+        return f"context_recall@{'all' if self.k is None else self.k}"
+
+
+class ContextRecallSim(Metric):
+    """
+    Context Recall@k (similarity-based).
+
+    Define relevant docs via cosine(question, doc) >= threshold over the WHOLE retrieved list
+    (after de-dup). Recall@k is the fraction of those 'relevant' docs captured in Top-k.
+
+    Inputs:
+      - question_embedding_field: sample[question_embedding_field] -> List[float]
+      - doc_embedding_field:      sample[doc_embedding_field] -> Dict[doc_id, List[float]]
+      - If embeddings missing and `embedder` is provided, will try to embed from text:
+          * question_field (str)
+          * doc_text_field: Dict[doc_id, str or List[str]] -> we embed the doc text (str) or join/aggregate list.
+
+    Config:
+      - k: int | None (None => use full retrieved length)
+      - threshold: float in [-1,1], default 0.3
+      - agg_doc: "mean" | "max" for aggregating multiple chunks per doc (default "max")
+      - retrieved_field: str = "retrieved_docs"
+      - question_field: str = "question"
+      - doc_text_field: str = "doc_text"
+      - question_embedding_field: str = "question_embedding"
+      - doc_embedding_field: str = "doc_embedding"
+      - embedder: Optional[callable] converting str or List[str] -> vector(s)
+      - l2_normalize: bool = True
+      - dedup: bool = True
+
+    Returns:
+      { f"context_recall_sim@{k_str}": float in [0,1] or None }.
+      None when no doc meets the threshold (denominator=0) or embeddings/texts insufficient.
+    """
+    name = "context_recall_sim"
+
+    def __init__(
+        self,
+        k: int | None = 5,
+        *,
+        threshold: float = 0.3,
+        agg_doc: str = "max",
+        retrieved_field: str = "retrieved_docs",
+        question_field: str = "question",
+        doc_text_field: str = "doc_text",
+        question_embedding_field: str = "question_embedding",
+        doc_embedding_field: str = "doc_embedding",
+        embedder: Any | None = None,
+        l2_normalize: bool = True,
+        dedup: bool = True,
+    ) -> None:
+        if k is not None and k <= 0:
+            raise ValueError("k must be positive or None.")
+        if agg_doc not in {"mean", "max"}:
+            raise ValueError('agg_doc must be one of {"mean","max"}')
+        self.k = k
+        self.threshold = float(threshold)
+        self.agg_doc = agg_doc
+        self.retrieved_field = retrieved_field
+        self.question_field = question_field
+        self.doc_text_field = doc_text_field
+        self.question_embedding_field = question_embedding_field
+        self.doc_embedding_field = doc_embedding_field
+        self.embedder = embedder
+        self.l2_normalize = l2_normalize
+        self.dedup = dedup
+
+    def compute(self, sample: Dict[str, Any]) -> Dict[str, Any]:
+        # question vector
+        q = self._get_question_vec(sample)
+        if q is None:
+            return {self._key(): None, "context_recall_error": "no question embedding and no usable embedder"}
+
+        # full retrieved ids (for defining relevant set R)
+        ranked = _as_ranked_list(sample.get(self.retrieved_field, []))
+        all_ids = _ranked_to_ids(ranked, dedup=self.dedup)
+        if not all_ids:
+            return {self._key(): None}
+
+        doc_emb_map = sample.get(self.doc_embedding_field, {}) or {}
+        # compute similarity for every deduped retrieved doc
+        sims_all: Dict[Doc, float] = {}
+        for did in all_ids:
+            vec = doc_emb_map.get(did)
+            if isinstance(vec, list) and vec:
+                sims_all[did] = self._cos(q, vec)
+                continue
+            # try embed from text if available
+            if self.embedder is not None:
+                text_map = sample.get(self.doc_text_field, {}) or {}
+                t = text_map.get(did)
+                if isinstance(t, str):
+                    v = self._embed_one(t)
+                    if v is not None:
+                        sims_all[did] = self._cos(q, v)
+                elif isinstance(t, (list, tuple)):
+                    segs = [s for s in t if isinstance(s, str) and s.strip()]
+                    vecs = self._embed_many(segs) if segs else []
+                    if vecs:
+                        seg_sims = [self._cos(q, v) for v in vecs]
+                        sims_all[did] = max(seg_sims) if self.agg_doc == "max" else (sum(seg_sims)/len(seg_sims))
+
+        if not sims_all:
+            return {self._key(): None, "context_recall_error": "no usable doc embeddings/texts"}
+
+        # define 'relevant' docs by threshold over the WHOLE retrieved list
+        relevant_ids = {did for did, s in sims_all.items() if s >= self.threshold}
+        if not relevant_ids:
+            return {self._key(): None}  # denominator 0 -> undefined
+
+        # take top-k and compute recall@k
+        k_cut = len(all_ids) if self.k is None else self.k
+        topk = all_ids[:k_cut]
+        hits = sum(1 for d in topk if d in relevant_ids)
+        rec = hits / max(1, len(relevant_ids))
+        return {self._key(): float(rec)}
+
+    # ------------------------ helpers ------------------------
+
+    def _key(self) -> str:
+        return f"context_recall_sim@{'all' if self.k is None else self.k}"
+
+    def _cos(self, a: List[float], b: List[float]) -> float:
+        if self.l2_normalize:
+            a = self._l2(a); b = self._l2(b)
+        try:
+            return _cosine_sim(a, b)
+        except NameError:
+            dot = sum(x*y for x, y in zip(a, b))
+            na = sum(x*x for x in a) ** 0.5
+            nb = sum(y*y for y in b) ** 0.5
+            return 0.0 if na == 0.0 or nb == 0.0 else dot / (na * nb)
+
+    @staticmethod
+    def _l2(v: List[float]) -> List[float]:
+        import math
+        n = math.sqrt(sum(x*x for x in v)) or 1.0
+        return [x / n for x in v]
+
+    def _get_question_vec(self, sample: Dict[str, Any]) -> List[float] | None:
+        vec = sample.get(self.question_embedding_field)
+        if isinstance(vec, list) and vec:
+            return vec
+        if self.embedder is not None:
+            text = sample.get(self.question_field)
+            if isinstance(text, str):
+                return self._embed_one(text)
+        return None
+
+    def _embed_one(self, text: str) -> List[float] | None:
+        try:
+            v = self.embedder(text)  # type: ignore
+            if isinstance(v, list):
+                return [float(x) for x in v]
+            if hasattr(v, "__iter__"):
+                return [float(x) for x in list(v)]
+        except Exception:
+            return None
+        return None
+
+    def _embed_many(self, texts: List[str]) -> List[List[float]]:
+        try:
+            v = self.embedder(texts)  # type: ignore
+            if isinstance(v, list) and v and isinstance(v[0], list):
+                return [[float(x) for x in vec] for vec in v]
+        except Exception:
+            outs: List[List[float]] = []
+            for t in texts:
+                vt = self._embed_one(t)
+                if vt is not None:
+                    outs.append(vt)
+            return outs
+        return []
+
+class CitationAccuracy(Metric):
+    """
+    Citation Accuracy on inline citations in the model answer.
+
+    Goal:
+      Measure how many cited document IDs in the answer actually point to the intended target set:
+        - against="retrieved": Top-k retrieved IDs (default)
+        - against="gold":      gold relevant set (graded rel>0 or binary reference_docs)
+
+    Sample fields:
+      - answer: str, containing inline citations like "[1]", "[1,2]", "[d3]" (comma/space separated)
+      - citation_map (optional): Dict[str, Doc] mapping numeric markers to doc IDs, e.g. {"1":"d2","2":"d5"}
+      - retrieved_docs: ranked list of retrieved items [id] or [(id,score)]  (for against="retrieved")
+      - relevance / reference_docs: gold labels (for against="gold")
+
+      Optional universe hints (用於辨識直接以 doc_id 引用時的可用全集，非必需):
+      - doc_text: Dict[doc_id, str or List[str]]  (keys provide doc_id universe)
+      - doc_embedding: Dict[doc_id, List[float]]  (keys provide doc_id universe)
+
+    Config:
+      - against: "retrieved" | "gold" (default "retrieved")
+      - k: int | None (cutoff for Top-k when against="retrieved"; None => full list)
+      - retrieved_field: str = "retrieved_docs"
+      - rel_field: str = "relevance"
+      - binary_fallback_field: str = "reference_docs"
+      - citation_map_field: str = "citation_map"
+      - dedup: bool = True
+      - allow_free_ids: bool = True
+          If True, citations like "[d7]" are accepted even without citation_map, as long as 'd7'
+          appears in any known universe (retrieved ids, doc_text keys, doc_embedding keys).
+
+    Returns:
+      {
+        f"citation_acc[{against}]@{k_str}": float in [0,1] or None,
+        "citation_num": int,            # total raw citation markers found
+        "citation_resolved": int,       # markers resolved to doc IDs
+        "citation_in_target": int       # resolved & inside target set
+      }
+      If nothing to evaluate (no citations resolved or no target), metric returns None.
+    """
+    name = "citation_accuracy"
+
+    def __init__(
+        self,
+        *,
+        against: str = "retrieved",
+        k: int | None = 5,
+        retrieved_field: str = "retrieved_docs",
+        rel_field: str = "relevance",
+        binary_fallback_field: str = "reference_docs",
+        citation_map_field: str = "citation_map",
+        dedup: bool = True,
+        allow_free_ids: bool = True,
+    ) -> None:
+        if against not in {"retrieved", "gold"}:
+            raise ValueError('against must be one of {"retrieved","gold"}')
+        if k is not None and k <= 0:
+            raise ValueError("k must be positive or None.")
+        self.against = against
+        self.k = k
+        self.retrieved_field = retrieved_field
+        self.rel_field = rel_field
+        self.binary_fallback_field = binary_fallback_field
+        self.citation_map_field = citation_map_field
+        self.dedup = dedup
+        self.allow_free_ids = allow_free_ids
+
+    # ------------------------------- main -------------------------------
+
+    def compute(self, sample: Dict[str, Any]) -> Dict[str, Any]:
+        answer = sample.get("answer") or ""
+        raw_tokens = self._extract_citation_tokens(answer)
+        total_raw = len(raw_tokens)
+
+        # Universe of known doc IDs (for resolving free-form IDs like [d3])
+        universe = self._collect_universe(sample)
+
+        # Resolve tokens -> doc_ids
+        c_map = sample.get(self.citation_map_field, {}) or {}
+        resolved: List[Doc] = []
+        for tok in raw_tokens:
+            # 1) citation_map wins if available (numeric or custom key)
+            if isinstance(c_map, dict) and tok in c_map:
+                resolved.append(c_map[tok])
+                continue
+            # 2) allow free-form IDs like [d3], [DOC_12] if present in universe
+            if self.allow_free_ids and tok in universe:
+                resolved.append(tok)
+                continue
+            # 3) also try numeric-in-string fallback like leading/trailing spaces
+            if self.allow_free_ids and tok.strip() in universe:
+                resolved.append(tok.strip())
+
+        num_resolved = len(resolved)
+        if num_resolved == 0:
+            return {self._key(): None, "citation_num": total_raw, "citation_resolved": 0, "citation_in_target": 0}
+
+        # Build target set
+        target: Set[Doc] | None = None
+        if self.against == "retrieved":
+            ranked = _as_ranked_list(sample.get(self.retrieved_field, []))
+            retrieved_ids = _ranked_to_ids(ranked, dedup=self.dedup)
+            if retrieved_ids:
+                k_cut = len(retrieved_ids) if self.k is None else self.k
+                target = set(retrieved_ids[:k_cut])
+        else:  # gold
+            target = self._gold_set(sample)
+
+        if not target:
+            return {self._key(): None, "citation_num": total_raw, "citation_resolved": num_resolved, "citation_in_target": 0}
+
+        in_target = sum(1 for d in resolved if d in target)
+        prec = in_target / max(1, num_resolved)
+
+        return {
+            self._key(): float(prec),
+            "citation_num": total_raw,
+            "citation_resolved": num_resolved,
+            "citation_in_target": in_target,
+        }
+
+    # ----------------------------- helpers ------------------------------
+
+    def _key(self) -> str:
+        k_str = "all" if (self.against == "retrieved" and self.k is None) else (str(self.k) if self.against == "retrieved" else "gold")
+        return f"citation_acc[{self.against}]@{k_str}"
+
+    def _extract_citation_tokens(self, text: str) -> List[str]:
+        """
+        Extract tokens inside square brackets that look like citations.
+        Examples matched: "[1]", "[1,2]", "[d3]", "[ d4 ; d5 ]"
+        We split by comma/semicolon/space and keep alnum/underscore/dash tokens.
+        """
+        import re
+        tokens: List[str] = []
+        # find bracketed segments
+        for seg in re.findall(r"\[([^\[\]]+)\]", text or ""):
+            # split by commas/semicolons/spaces
+            parts = re.split(r"[,\s;]+", seg)
+            for p in parts:
+                p = p.strip()
+                if not p:
+                    continue
+                # keep only reasonable tokens (alnum + _ -)
+                if re.fullmatch(r"[A-Za-z0-9_\-]+", p):
+                    tokens.append(p)
+        return tokens
+
+    def _collect_universe(self, sample: Dict[str, Any]) -> Set[Doc]:
+        """
+        Build a universe of known doc IDs from retrieved list and optional maps (doc_text/doc_embedding).
+        Helps resolve free-form IDs like [d3] without a citation_map.
+        """
+        uni: Set[Doc] = set()
+        # retrieved ids
+        try:
+            ranked = _as_ranked_list(sample.get(self.retrieved_field, []))
+            uni.update(_ranked_to_ids(ranked, dedup=True))
+        except Exception:
+            pass
+        # doc_text keys
+        dt = sample.get("doc_text", {})
+        if isinstance(dt, dict):
+            uni.update(dt.keys())
+        # doc_embedding keys
+        de = sample.get("doc_embedding", {})
+        if isinstance(de, dict):
+            uni.update(de.keys())
+        # gold ids (for against="gold")
+        uni.update(self._gold_set(sample) or set())
+        return uni
+
+    def _gold_set(self, sample: Dict[str, Any]) -> Set[Doc] | None:
+        graded = sample.get(self.rel_field)
+        if isinstance(graded, dict) and graded:
+            pos = {k for k, v in graded.items() if self._is_pos(v)}
+            if pos:
+                return pos
+        gold_ids = _as_id_set(sample.get(self.binary_fallback_field, []))
+        return gold_ids if gold_ids else None
+
+    @staticmethod
+    def _is_pos(v: Any) -> bool:
+        try:
+            return float(v) > 0.0
+        except Exception:
+            return False
+
+class EvidenceDensity(Metric):
+    """
+    Evidence Density via lexical overlap (n-gram coverage).
+
+    Definition:
+      Build an evidence vocabulary from the evidence texts, then compute the fraction of
+      answer n-grams that appear in the evidence vocabulary.
+
+      density = matched_answer_ngrams / total_answer_ngrams
+
+    Evidence modes:
+      - mode="reference": use sample["reference"] or ["reference_texts"] as evidence (str or List[str])
+      - mode="context"  : use top-k of sample["retrieved_docs"], and take texts from sample["doc_text"][doc_id]
+                          where values can be str or List[str] (pre-chunked passages)
+
+    Config:
+      - mode: "reference" | "context" (default "context")
+      - n: n-gram size (int >= 1, default 1)
+      - k: cutoff for context mode (None => all retrieved)
+      - retrieved_field: str = "retrieved_docs"
+      - doc_text_field: str = "doc_text"
+      - reference_field: str = "reference"  (also accepts "reference_texts")
+      - dedup: de-duplicate retrieved IDs before truncation (default True)
+
+      Normalization of text (applied to both answer and evidence):
+      - lowercase (bool, default True)
+      - strip_punct (bool, default True)
+      - collapse_whitespace (bool, default True)
+      - remove_articles (bool, default False)  # English-only
+      - extra_strip_chars (str, default "")
+
+    Returns:
+      {
+        key: float in [0,1] or None,
+        "evid_density_matched": int,  # matched answer n-grams
+        "evid_density_total": int     # total answer n-grams
+      }
+      If no evidence texts or no answer n-grams (e.g., empty answer), returns None and counts.
+    """
+    name = "evidence_density"
+
+    def __init__(
+        self,
+        *,
+        mode: str = "context",
+        n: int = 1,
+        k: int | None = 5,
+        retrieved_field: str = "retrieved_docs",
+        doc_text_field: str = "doc_text",
+        reference_field: str = "reference",
+        dedup: bool = True,
+        # normalization
+        lowercase: bool = True,
+        strip_punct: bool = True,
+        collapse_whitespace: bool = True,
+        remove_articles: bool = False,
+        extra_strip_chars: str = "",
+    ) -> None:
+        if mode not in {"reference", "context"}:
+            raise ValueError('mode must be one of {"reference","context"}')
+        if n <= 0:
+            raise ValueError("n must be >= 1")
+        if k is not None and k <= 0:
+            raise ValueError("k must be positive or None.")
+        self.mode = mode
+        self.n = int(n)
+        self.k = k
+        self.retrieved_field = retrieved_field
+        self.doc_text_field = doc_text_field
+        self.reference_field = reference_field
+        self.dedup = dedup
+
+        self.lowercase = lowercase
+        self.strip_punct = strip_punct
+        self.collapse_whitespace = collapse_whitespace
+        self.remove_articles = remove_articles
+        self.extra_strip_chars = extra_strip_chars
+
+    # ------------------------------ main ------------------------------
+
+    def compute(self, sample: Dict[str, Any]) -> Dict[str, Any]:
+        answer = sample.get("answer") or ""
+        ans_tokens = self._tokenize(answer)
+        ans_ngrams = self._ngrams(ans_tokens, self.n)
+        total = len(ans_ngrams)
+
+        if total == 0:
+            return {self._key(): None, "evid_density_matched": 0, "evid_density_total": 0}
+
+        evid_texts = self._collect_evidence_texts(sample)
+        if not evid_texts:
+            return {self._key(): None, "evid_density_matched": 0, "evid_density_total": total}
+
+        # build evidence n-gram set
+        evid_set: set[tuple[str, ...]] = set()
+        for t in evid_texts:
+            toks = self._tokenize(t)
+            evid_set.update(self._ngrams(toks, self.n))
+
+        if not evid_set:
+            return {self._key(): None, "evid_density_matched": 0, "evid_density_total": total}
+
+        matched = sum(1 for g in ans_ngrams if g in evid_set)
+        density = matched / max(1, total)
+        return {self._key(): float(density), "evid_density_matched": matched, "evid_density_total": total}
+
+    # ------------------------------ helpers ------------------------------
+
+    def _key(self) -> str:
+        base = f"evidence_density@{self.mode}"
+        if self.mode == "context":
+            base += f"@{'all' if self.k is None else self.k}"
+        if self.n != 1:
+            base += f"[n{self.n}]"
+        return base
+
+    def _collect_evidence_texts(self, sample: Dict[str, Any]) -> list[str]:
+        evs: list[str] = []
+        # reference mode
+        if self.mode == "reference":
+            ref = sample.get(self.reference_field)
+            if isinstance(ref, str) and ref.strip():
+                evs.append(ref.strip())
+            elif isinstance(ref, (list, tuple)):
+                evs.extend([x for x in ref if isinstance(x, str) and x.strip()])
+            # alias: reference_texts
+            ref2 = sample.get("reference_texts")
+            if isinstance(ref2, str) and ref2.strip():
+                evs.append(ref2.strip())
+            elif isinstance(ref2, (list, tuple)):
+                evs.extend([x for x in ref2 if isinstance(x, str) and x.strip()])
+            return evs
+
+        # context mode
+        ranked = sample.get(self.retrieved_field, []) or []
+        try:
+            rlist = _as_ranked_list(ranked)
+            ids = _ranked_to_ids(rlist, dedup=self.dedup)
+        except Exception:
+            ids = [it[0] if isinstance(it, tuple) else it for it in ranked]
+
+        if not ids:
+            return []
+
+        k_cut = len(ids) if self.k is None else self.k
+        topk = ids[:k_cut]
+        text_map = sample.get(self.doc_text_field, {}) or {}
+        for did in topk:
+            t = text_map.get(did)
+            if isinstance(t, str) and t.strip():
+                evs.append(t.strip())
+            elif isinstance(t, (list, tuple)):
+                evs.extend([x for x in t if isinstance(x, str) and x.strip()])
+        return evs
+
+    def _tokenize(self, s: str) -> List[str]:
+        import re, string, unicodedata
+        t = s or ""
+        t = unicodedata.normalize("NFKC", t)
+        if self.lowercase:
+            t = t.lower()
+        if self.strip_punct:
+            t = "".join(ch for ch in t if ch not in string.punctuation)
+        if self.extra_strip_chars:
+            t = t.translate(str.maketrans("", "", self.extra_strip_chars))
+        if self.remove_articles:
+            t = re.sub(r"\b(a|an|the)\b", " ", t)
+        if self.collapse_whitespace:
+            t = " ".join(t.split())
+        return t.split() if t else []
+
+    @staticmethod
+    def _ngrams(tokens: List[str], n: int) -> List[Tuple[str, ...]]:
+        if n <= 0 or len(tokens) < n:
+            return []
+        return [tuple(tokens[i:i+n]) for i in range(len(tokens) - n + 1)]
+
+
 # -------------------------- local math utils --------------------------
 
 def _cosine_sim(a: List[float], b: List[float]) -> float:

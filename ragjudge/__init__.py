@@ -17,6 +17,11 @@ from .metrics import (       # noqa: F401
     BERTScore,
     AnswerRelevancySim,
     FaithfulnessNLI,
-    
+    ContextPrecisionAtK,
+    ContextPrecisionSim,
+    ContextRecallAtK,
+    ContextRecallSim,
+    CitationAccuracy,
+    EvidenceDensity,
 )
 from .evaluate import evaluate, summarize  # noqa: F401
