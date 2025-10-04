@@ -2644,6 +2644,633 @@ class EvidenceDensity(Metric):
             return []
         return [tuple(tokens[i:i+n]) for i in range(len(tokens) - n + 1)]
 
+class TTFT(Metric):
+    """
+    Time to First Token (TTFT).
+
+    Measures the latency between generation start and the arrival of the first output token.
+
+    This metric is transport-agnostic and supports multiple input layouts so you can
+    feed traces collected from different inference stacks. The first matching source wins.
+
+    Preferred fields (absolute or monotonic timestamps; seconds since epoch is fine):
+      - sample[start_field]            (default: "gen_start_time")
+      - sample[first_token_field]      (default: "gen_first_token_time")
+
+    Fallback (event list):
+      - sample[events_field]           (default: "events") where each item can be:
+          * dict with keys: {"name": <str>, "t": <float>}
+          * tuple/list: (name, t)
+        The metric searches for:
+          * start_event_name           (default: "gen_start")
+          * first_event_name           (default: "first_token")
+
+    Config:
+      - unit: "ms" or "s" for the output unit (default "ms").
+      - clamp_non_positive_to_none: if True, non-positive intervals become None (default True).
+
+    Returns:
+      { "ttft_ms": float | None }  # when unit="ms"
+      or
+      { "ttft_s": float | None }   # when unit="s"
+
+    Notes:
+      - The metric does not do any clock sync; use a single time source (e.g. time.monotonic()).
+      - If only one of the two timestamps is present, the result is None.
+    """
+    name = "ttft"
+
+    def __init__(
+        self,
+        *,
+        start_field: str = "gen_start_time",
+        first_token_field: str = "gen_first_token_time",
+        events_field: str = "events",
+        start_event_name: str = "gen_start",
+        first_event_name: str = "first_token",
+        unit: str = "ms",
+        clamp_non_positive_to_none: bool = True,
+    ) -> None:
+        if unit not in {"ms", "s"}:
+            raise ValueError('unit must be "ms" or "s"')
+        self.start_field = start_field
+        self.first_field = first_token_field
+        self.events_field = events_field
+        self.start_event_name = start_event_name
+        self.first_event_name = first_event_name
+        self.unit = unit
+        self.clamp_non_positive_to_none = clamp_non_positive_to_none
+
+    def compute(self, sample: Dict[str, Any]) -> Dict[str, Any]:
+        t0 = sample.get(self.start_field, None)
+        t1 = sample.get(self.first_field, None)
+
+        # If direct fields are not both provided, try to resolve from events.
+        if not self._is_num(t0) or not self._is_num(t1):
+            t0_e, t1_e = self._from_events(sample.get(self.events_field))
+            # prefer explicitly provided fields when valid; else use events
+            if not self._is_num(t0):
+                t0 = t0_e
+            if not self._is_num(t1):
+                t1 = t1_e
+
+        if not self._is_num(t0) or not self._is_num(t1):
+            return {self._key(): None}
+
+        dt = float(t1) - float(t0)
+        if self.clamp_non_positive_to_none and dt <= 0:
+            return {self._key(): None}
+
+        if self.unit == "ms":
+            dt *= 1000.0
+
+        return {self._key(): float(dt)}
+
+    # --------------------- helpers ---------------------
+
+    def _key(self) -> str:
+        return "ttft_ms" if self.unit == "ms" else "ttft_s"
+
+    @staticmethod
+    def _is_num(x: Any) -> bool:
+        try:
+            float(x)
+            return True
+        except Exception:
+            return False
+
+    def _from_events(self, events: Any) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Parse events to find timestamps for start and first token.
+        Supported event item formats:
+          - {"name": "gen_start", "t": 123.456}
+          - ("gen_start", 123.456) or ["gen_start", 123.456]
+        """
+        if not isinstance(events, (list, tuple)):
+            return None, None
+
+        t_start: Optional[float] = None
+        t_first: Optional[float] = None
+
+        for ev in events:
+            name, t = None, None
+            if isinstance(ev, dict):
+                name = ev.get("name")
+                t = ev.get("t")
+            elif isinstance(ev, (list, tuple)) and len(ev) >= 2:
+                name = ev[0]
+                t = ev[1]
+
+            if not self._is_num(t) or not isinstance(name, str):
+                continue
+
+            if name == self.start_event_name:
+                t_start = float(t)
+            elif name == self.first_event_name:
+                # Keep the earliest "first_token" if multiple exist
+                cand = float(t)
+                t_first = cand if (t_first is None or cand < t_first) else t_first
+
+        return t_start, t_first
+
+class E2ELatency(Metric):
+    """
+    End-to-End Latency for a single sample.
+
+    Definition:
+      end_to_end = end_time - start_time
+
+    How start/end are found (first non-empty wins):
+      START:
+        1) sample["e2e_start"], sample["request_start"], sample["start_time"]
+        2) sample["events"] list with {"type": "...", "t": ...} choosing the earliest among:
+           {"type" in ["request_start","request","start","send_start","prompt_sent"]}
+
+      END:
+        1) sample["e2e_end"], sample["response_end"], sample["end_time"]
+        2) sample["events"] list choosing the latest among:
+           {"type" in ["response_end","stream_end","last_token","finish","done"]}
+
+    Accepted timestamp formats:
+      - float / int seconds since epoch
+      - int milliseconds since epoch (auto-detect if value > 1e12)
+      - ISO8601 string (e.g., "2024-10-01T12:34:56.789Z")
+
+    Config:
+      - unit: "ms" | "s"  (default "ms")
+      - decimals: int | None (rounding; default None -> no rounding)
+      - clamp_non_positive_to_none: bool (default True) -> if end<=start => returns None
+      - key: optional custom output key (default "e2e_latency")
+
+    Returns:
+      { key: float | None }
+    """
+    name = "e2e_latency"
+
+    def __init__(
+        self,
+        *,
+        unit: str = "ms",
+        decimals: int | None = None,
+        clamp_non_positive_to_none: bool = True,
+        key: str | None = None,
+    ) -> None:
+        if unit not in {"ms", "s"}:
+            raise ValueError('unit must be "ms" or "s"')
+        self.unit = unit
+        self.decimals = decimals
+        self.clamp_non_positive_to_none = clamp_non_positive_to_none
+        self._key = key or ("e2e_ms" if unit == "ms" else "e2e_s")
+
+    # ------------------------------ main ------------------------------
+    def compute(self, sample: Dict[str, Any]) -> Dict[str, Any]:
+        start = self._get_start(sample)
+        end = self._get_end(sample)
+
+        if start is None or end is None:
+            return {self._key: None}
+
+        dt_sec = end - start
+        if self.clamp_non_positive_to_none and (dt_sec <= 0):
+            return {self._key: None}
+
+        val = dt_sec * 1000.0 if self.unit == "ms" else dt_sec
+        if self.decimals is not None:
+            val = round(float(val), self.decimals)
+        else:
+            val = float(val)
+        return {self._key: val}
+
+    # --------------------------- time picking --------------------------
+    def _get_start(self, s: Dict[str, Any]) -> Optional[float]:
+        # direct fields
+        for k in ("e2e_start", "request_start", "start_time"):
+            t = self._parse_time(s.get(k))
+            if t is not None:
+                return t
+        # events earliest start-like
+        ev = s.get("events")
+        if isinstance(ev, list):
+            cands = []
+            for e in ev:
+                if not isinstance(e, dict):
+                    continue
+                typ = str(e.get("type","")).lower()
+                if typ in {"request_start","request","start","send_start","prompt_sent"}:
+                    t = self._parse_time(e.get("t"))
+                    if t is not None:
+                        cands.append(t)
+            if cands:
+                return min(cands)
+        return None
+
+    def _get_end(self, s: Dict[str, Any]) -> Optional[float]:
+        # direct fields
+        for k in ("e2e_end", "response_end", "end_time"):
+            t = self._parse_time(s.get(k))
+            if t is not None:
+                return t
+        # events latest end-like
+        ev = s.get("events")
+        if isinstance(ev, list):
+            cands = []
+            for e in ev:
+                if not isinstance(e, dict):
+                    continue
+                typ = str(e.get("type","")).lower()
+                if typ in {"response_end","stream_end","last_token","finish","done"}:
+                    t = self._parse_time(e.get("t"))
+                    if t is not None:
+                        cands.append(t)
+            if cands:
+                return max(cands)
+        return None
+
+    # --------------------------- parsing utils -------------------------
+    @staticmethod
+    def _parse_time(v: Any) -> Optional[float]:
+        """
+        Return POSIX seconds (float) or None.
+        Supports: float/int seconds, int ms (auto), ISO8601 string.
+        """
+        if v is None:
+            return None
+        # numeric
+        if isinstance(v, (int, float)):
+            x = float(v)
+            # Heuristic: > 1e12 -> ms epoch; > 1e9 -> s epoch
+            if x > 1e12:
+                return x / 1000.0
+            return x
+        # string -> try float, then ISO8601
+        if isinstance(v, str):
+            vs = v.strip()
+            # as float seconds
+            try:
+                x = float(vs)
+                if x > 1e12:
+                    return x / 1000.0
+                return x
+            except Exception:
+                pass
+            # ISO8601
+            try:
+                from datetime import datetime, timezone
+                # accept 'Z' and offsets
+                if vs.endswith("Z"):
+                    dt = datetime.fromisoformat(vs.replace("Z", "+00:00"))
+                else:
+                    dt = datetime.fromisoformat(vs)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.timestamp()
+            except Exception:
+                return None
+        # other types -> unsupported
+        return None
+
+class TokensPerRequest(Metric):
+    """
+    Tokens per Request (TPR).
+
+    Input preference (first non-empty wins):
+      - direct counts:
+          sample["total_tokens"], sample["prompt_tokens"], sample["completion_tokens"]
+      - optional tokenizer or heuristic from text:
+          - prompt_text_field: "prompt" (fallback to "question")
+          - completion_text_field: "answer"
+        You can pass:
+          * tokenizer: Optional[callable], returns token count for a str
+          * encoding_name: Optional[str], will use `tiktoken.get_encoding(encoding_name)`
+            as tokenizer if available; ignore if library missing.
+
+    Config:
+      - prompt_text_field: default "prompt" (fallback to "question")
+      - completion_text_field: default "answer"
+      - include_breakdown: output per-part counts alongside total (default True)
+      - estimate_mode: "auto" | "latin4" | "cjk1" (default "auto")
+          "latin4": ~1 token / 4 chars
+          "cjk1"  : ~1 token / 1 char
+          "auto"  : detect if CJK present per text block; choose cjk1 or latin4.
+
+    Returns:
+      {
+        "tokens_total": int or None,
+        "tokens_prompt": int or None,
+        "tokens_completion": int or None
+      }
+    """
+    name = "tokens_per_request"
+
+    def __init__(
+        self,
+        *,
+        prompt_text_field: str = "prompt",
+        completion_text_field: str = "answer",
+        tokenizer: Any | None = None,
+        encoding_name: str | None = None,
+        include_breakdown: bool = True,
+        estimate_mode: str = "auto",
+    ) -> None:
+        if estimate_mode not in {"auto", "latin4", "cjk1"}:
+            raise ValueError('estimate_mode must be one of {"auto","latin4","cjk1"}')
+        self.prompt_text_field = prompt_text_field
+        self.completion_text_field = completion_text_field
+        self.tokenizer = tokenizer
+        self.encoding_name = encoding_name
+        self.include_breakdown = include_breakdown
+        self.estimate_mode = estimate_mode
+        self._tok = self._resolve_tokenizer(tokenizer, encoding_name)
+
+    def compute(self, sample: Dict[str, Any]) -> Dict[str, Any]:
+        # 1) direct counts
+        t_total = self._as_int(sample.get("total_tokens"))
+        t_prompt = self._as_int(sample.get("prompt_tokens"))
+        t_completion = self._as_int(sample.get("completion_tokens"))
+
+        # Fill missing via sum/diff if possible
+        if t_total is None and (t_prompt is not None or t_completion is not None):
+            if t_prompt is not None and t_completion is not None:
+                t_total = t_prompt + t_completion
+        if t_prompt is None and t_total is not None and t_completion is not None:
+            t_prompt = max(0, t_total - t_completion)
+        if t_completion is None and t_total is not None and t_prompt is not None:
+            t_completion = max(0, t_total - t_prompt)
+
+        # 2) fallback: estimate from text
+        if t_total is None or t_prompt is None or t_completion is None:
+            p_txt = self._get_prompt_text(sample)
+            c_txt = self._get_completion_text(sample)
+            if p_txt is not None and t_prompt is None:
+                t_prompt = self._count_tokens(p_txt)
+            if c_txt is not None and t_completion is None:
+                t_completion = self._count_tokens(c_txt)
+            if t_total is None and (t_prompt is not None or t_completion is not None):
+                t_total = (t_prompt or 0) + (t_completion or 0)
+
+        out: Dict[str, Any] = {"tokens_total": t_total}
+        if self.include_breakdown:
+            out.update({"tokens_prompt": t_prompt, "tokens_completion": t_completion})
+        return out
+
+    # --------------------------- helpers ---------------------------
+    def _get_prompt_text(self, s: Dict[str, Any]) -> str | None:
+        # prefer explicit prompt; else fallback to question
+        txt = s.get(self.prompt_text_field)
+        if isinstance(txt, str) and txt:
+            return txt
+        q = s.get("question")
+        return q if isinstance(q, str) else None
+
+    def _get_completion_text(self, s: Dict[str, Any]) -> str | None:
+        c = s.get(self.completion_text_field)
+        return c if isinstance(c, str) else None
+
+    @staticmethod
+    def _as_int(v: Any) -> int | None:
+        try:
+            if v is None:
+                return None
+            if isinstance(v, bool):
+                return None
+            x = int(v)
+            return x if x >= 0 else None
+        except Exception:
+            return None
+
+    def _resolve_tokenizer(self, tok: Any | None, encoding_name: str | None):
+        if tok is not None:
+            return tok
+        if encoding_name:
+            try:
+                import tiktoken  # type: ignore
+                enc = tiktoken.get_encoding(encoding_name)
+                return lambda s: len(enc.encode(s or ""))
+            except Exception:
+                return None
+        return None
+
+    def _count_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        # use tokenizer if available
+        if self._tok is not None:
+            try:
+                n = self._tok(text)
+                if isinstance(n, int):
+                    return max(0, n)
+                if hasattr(n, "__len__"):
+                    return max(0, len(n))  # if tokenizer returns a list of ids
+            except Exception:
+                pass
+        # heuristic
+        return self._heuristic_tokens(text)
+
+    def _heuristic_tokens(self, text: str) -> int:
+        if self.estimate_mode == "latin4":
+            return (len(text) + 3) // 4
+        if self.estimate_mode == "cjk1":
+            return len(text)
+        # auto: detect CJK chars presence ratio
+        cjk = sum(1 for ch in text if self._is_cjk(ch))
+        if cjk >= max(1, len(text) // 4):
+            # enough CJK -> count per char
+            return len(text)
+        # default latin-ish
+        return (len(text) + 3) // 4
+
+    @staticmethod
+    def _is_cjk(ch: str) -> bool:
+        cp = ord(ch)
+        return (
+            (0x4E00 <= cp <= 0x9FFF) or (0x3400 <= cp <= 0x4DBF) or (0x20000 <= cp <= 0x2A6DF) or
+            (0x2A700 <= cp <= 0x2B73F) or (0x2B740 <= cp <= 0x2B81F) or (0x2B820 <= cp <= 0x2CEAF) or
+            (0xF900 <= cp <= 0xFAFF) or (0x3040 <= cp <= 0x30FF) or (0x31F0 <= cp <= 0x31FF) or
+            (0x1100 <= cp <= 0x11FF) or (0x3130 <= cp <= 0x318F) or (0xAC00 <= cp <= 0xD7AF)
+        )
+
+
+class CostPer1kRequest(Metric):
+    """
+    Cost per 1k Requests (USD), based on token counts and unit prices.
+
+    Pricing sources (priority):
+      1) Explicit per-1k prices passed to constructor:
+           prompt_price_per_1k, completion_price_per_1k, total_price_per_1k
+      2) pricing registry + model string:
+           pricing={"gpt-x":{"prompt":0.5,"completion":1.5}}
+           model can be in sample["model"] or passed in constructor.
+
+    Token sources:
+      - Prefer direct counts: sample["prompt_tokens"], ["completion_tokens"], ["total_tokens"]
+      - Else estimate from text using the same rules as TokensPerRequest (optional tokenizer/heuristic)
+
+    Config:
+      - currency: label only (default "USD")
+      - decimals: rounding for outputs (default 6)
+      - tokenizer / encoding_name / estimate_mode: see TokensPerRequest
+      - prompt_text_field / completion_text_field: see TokensPerRequest
+      - model: default None (can be provided per-sample)
+
+    Returns:
+      {
+        "cost_per_request_usd": float | None,
+        "cost_per_1k_requests_usd": float | None
+      }
+    """
+    name = "cost_per_1k_request"
+
+    def __init__(
+        self,
+        *,
+        prompt_price_per_1k: float | None = None,
+        completion_price_per_1k: float | None = None,
+        total_price_per_1k: float | None = None,
+        pricing: Dict[str, Dict[str, float]] | None = None,
+        model: str | None = None,
+        currency: str = "USD",
+        decimals: int = 6,
+        # tokenization/estimation options (shared with TPR)
+        prompt_text_field: str = "prompt",
+        completion_text_field: str = "answer",
+        tokenizer: Any | None = None,
+        encoding_name: str | None = None,
+        estimate_mode: str = "auto",
+    ) -> None:
+        self.prompt_price_per_1k = self._as_float(prompt_price_per_1k)
+        self.completion_price_per_1k = self._as_float(completion_price_per_1k)
+        self.total_price_per_1k = self._as_float(total_price_per_1k)
+        self.pricing = pricing or {}
+        self.model_default = model
+        self.currency = currency
+        self.decimals = int(decimals)
+
+        # tokenize options
+        self.prompt_text_field = prompt_text_field
+        self.completion_text_field = completion_text_field
+        self.estimate_mode = estimate_mode
+        self._tok = self._resolve_tokenizer(tokenizer, encoding_name)
+
+    def compute(self, sample: Dict[str, Any]) -> Dict[str, Any]:
+        # figure out pricing
+        p_prompt, p_completion, p_total = self._resolve_price(sample)
+
+        # get token counts (prefer direct, else estimate)
+        tp, tc, tt = self._get_token_counts(sample)
+
+        if tt is None and (tp is None or tc is None):
+            return {"cost_per_request_usd": None, "cost_per_1k_requests_usd": None}
+
+        # compute cost per request
+        cost = None
+        if p_total is not None and tt is not None:
+            cost = (tt / 1000.0) * p_total
+        else:
+            # need prompt/completion prices + tokens
+            if p_prompt is None or p_completion is None:
+                return {"cost_per_request_usd": None, "cost_per_1k_requests_usd": None}
+            if tp is None or tc is None:
+                # try to recover from total if available (split 50/50 as a last resort)
+                if tt is not None:
+                    tp = tt // 2
+                    tc = tt - tp
+                else:
+                    return {"cost_per_request_usd": None, "cost_per_1k_requests_usd": None}
+            cost = (tp / 1000.0) * p_prompt + (tc / 1000.0) * p_completion
+
+        cost = round(float(cost), self.decimals)
+        return {
+            "cost_per_request_usd": cost,
+            "cost_per_1k_requests_usd": round(cost * 1000.0, self.decimals),
+        }
+
+    # --------------------------- helpers ---------------------------
+    @staticmethod
+    def _as_float(v: Any) -> float | None:
+        try:
+            if v is None:
+                return None
+            return float(v)
+        except Exception:
+            return None
+
+    def _resolve_price(self, sample: Dict[str, Any]) -> tuple[float | None, float | None, float | None]:
+        # 1) explicit
+        if self.prompt_price_per_1k is not None or self.completion_price_per_1k is not None or self.total_price_per_1k is not None:
+            return self.prompt_price_per_1k, self.completion_price_per_1k, self.total_price_per_1k
+
+        # 2) pricing registry + model
+        mdl = sample.get("model") or self.model_default
+        if isinstance(mdl, str):
+            info = self.pricing.get(mdl) or {}
+            p_prompt = self._as_float(info.get("prompt"))
+            p_completion = self._as_float(info.get("completion"))
+            p_total = self._as_float(info.get("total"))
+            if any(x is not None for x in (p_prompt, p_completion, p_total)):
+                return p_prompt, p_completion, p_total
+
+        # none
+        return None, None, None
+
+    def _resolve_tokenizer(self, tok: Any | None, encoding_name: str | None):
+        if tok is not None:
+            return tok
+        if encoding_name:
+            try:
+                import tiktoken  # type: ignore
+                enc = tiktoken.get_encoding(encoding_name)
+                return lambda s: len(enc.encode(s or ""))
+            except Exception:
+                return None
+        return None
+
+    def _count_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        if self._tok is not None:
+            try:
+                n = self._tok(text)
+                if isinstance(n, int):
+                    return max(0, n)
+                if hasattr(n, "__len__"):
+                    return max(0, len(n))
+            except Exception:
+                pass
+        # heuristic
+        if self.estimate_mode == "latin4":
+            return (len(text) + 3) // 4
+        if self.estimate_mode == "cjk1":
+            return len(text)
+        # auto detect
+        cjk = sum(1 for ch in text if TokensPerRequest._is_cjk(ch))
+        if cjk >= max(1, len(text) // 4):
+            return len(text)
+        return (len(text) + 3) // 4
+
+    def _get_token_counts(self, s: Dict[str, Any]) -> tuple[int | None, int | None, int | None]:
+        tt = TokensPerRequest._as_int(s.get("total_tokens"))
+        tp = TokensPerRequest._as_int(s.get("prompt_tokens"))
+        tc = TokensPerRequest._as_int(s.get("completion_tokens"))
+        # fill by math
+        if tt is None and (tp is not None and tc is not None):
+            tt = tp + tc
+        if tp is None and tt is not None and tc is not None:
+            tp = max(0, tt - tc)
+        if tc is None and tt is not None and tp is not None:
+            tc = max(0, tt - tp)
+
+        # estimate if still missing
+        if tp is None:
+            p_txt = s.get("prompt") if isinstance(s.get("prompt"), str) else s.get("question")
+            if isinstance(p_txt, str):
+                tp = self._count_tokens(p_txt)
+        if tc is None:
+            c_txt = s.get("answer") if isinstance(s.get("answer"), str) else None
+            if isinstance(c_txt, str):
+                tc = self._count_tokens(c_txt)
+        if tt is None and (tp is not None or tc is not None):
+            tt = (tp or 0) + (tc or 0)
+        return tp, tc, tt
 
 # -------------------------- local math utils --------------------------
 

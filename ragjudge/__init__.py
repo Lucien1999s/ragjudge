@@ -23,5 +23,9 @@ from .metrics import (       # noqa: F401
     ContextRecallSim,
     CitationAccuracy,
     EvidenceDensity,
+    TTFT,
+    E2ELatency,
+    TokensPerRequest,
+    CostPer1kRequest,
 )
 from .evaluate import evaluate, summarize  # noqa: F401
