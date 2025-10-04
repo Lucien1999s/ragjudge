@@ -1,15 +1,57 @@
 [build-system]
-requires = ["setuptools>=61"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
 
 [project]
 name = "ragjudge"
-version = "0.0.1"
-description = "RAG evaluation metrics"
+version = "0.1.0"
+description = "Evaluate RAG systems with retrieval, overlap, citation, faithfulness, and latency metrics."
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = []
+license = {text = "MIT"}
+authors = [{ name = "Ting (Lucien Lin)" }]
+keywords = ["RAG", "evaluation", "LLM", "IR", "NLP", "metrics"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Intended Audience :: Developers",
+]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["ragjudge*"]
+dependencies = [
+  "numpy>=1.24",
+  "scikit-learn>=1.3",
+  "regex>=2023.10",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+nlp = [
+  "bert-score>=0.3",
+  "transformers>=4.44",
+  "torch>=2.3",
+]
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=4.1",
+  "ruff>=0.6",
+  "mypy>=1.10",
+  "twine>=5.0",
+  "build>=1.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/Lucien1999s/ragjudge"
+Issues = "https://github.com/Lucien1999s/ragjudge/issues"
+
+[project.scripts]
+ragjudge = "ragjudge.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+python_files = ["test_*.py", "*_test.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
