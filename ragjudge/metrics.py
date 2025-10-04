@@ -40,6 +40,128 @@ def _ranked_to_ids(ranked: List[Ranked], *, dedup: bool) -> List[Doc]:
         out.append(doc_id)
     return out
 
+def _unicode_normalize(text: str, lowercase: bool = True) -> str:
+    """
+    Unicode-aware normalization:
+    - NFKC to unify full/half width forms (important for CJK digits/symbols).
+    - Optional casefold() for robust lowercase across scripts.
+    """
+    import unicodedata
+    t = unicodedata.normalize("NFKC", text or "")
+    if lowercase:
+        t = t.casefold()
+    return t
+
+def _strip_unicode_punct(text: str) -> str:
+    """
+    Remove all Unicode punctuation and symbols (categories starting with 'P' or 'S').
+    This is broader and safer than ASCII-only string.punctuation for multilingual text.
+    """
+    import unicodedata
+    return "".join(ch for ch in text if (ch and (unicodedata.category(ch)[0] not in ("P", "S"))))
+
+def _remove_articles_en(text: str) -> str:
+    """
+    Remove English articles only (a, an, the). For CJK this is a no-op.
+    This function assumes input is already casefold'ed.
+    """
+    import re
+    # Word-boundary based; should have been normalized already.
+    return re.sub(r"\b(a|an|the)\b", " ", text)
+
+def _cjk_aware_tokenize(
+    text: str,
+    *,
+    lowercase: bool = True,
+    strip_punct: bool = True,
+    collapse_whitespace: bool = True,
+    remove_articles: bool = False,     # English-only
+    extra_strip_chars: str = "",
+) -> list[str]:
+    """
+    Mixed-language tokenizer:
+    - Latin letters/digits are grouped into words.
+    - CJK (Han/Hangul/Hiragana/Katakana) characters are treated as single-character tokens.
+    - Unicode punctuation and symbols are removed if strip_punct=True.
+    - Keeps behavior flags aligned with your metrics (lowercase, collapse whitespace, etc.).
+    """
+    import unicodedata
+    import re
+
+    t = _unicode_normalize(text or "", lowercase=lowercase)
+
+    if extra_strip_chars:
+        t = t.translate(str.maketrans("", "", extra_strip_chars))
+
+    if remove_articles:
+        # English-only article removal
+        t = _remove_articles_en(t)
+
+    # Optional punctuation/symbol stripping
+    if strip_punct:
+        t = _strip_unicode_punct(t)
+
+    # At this point, we want to split into tokens with the rule:
+    # - sequences of letters/digits (outside CJK blocks) are grouped,
+    # - each CJK character is a token,
+    # - whitespace separates tokens.
+    #
+    # We'll scan char-by-char and accumulate.
+    def _is_cjk_char(ch: str) -> bool:
+        cp = ord(ch)
+        # CJK Unified Ideographs + Exts
+        if (0x4E00 <= cp <= 0x9FFF) or (0x3400 <= cp <= 0x4DBF) or (0x20000 <= cp <= 0x2A6DF) \
+           or (0x2A700 <= cp <= 0x2B73F) or (0x2B740 <= cp <= 0x2B81F) or (0x2B820 <= cp <= 0x2CEAF) \
+           or (0xF900 <= cp <= 0xFAFF):
+            return True
+        # Hiragana
+        if 0x3040 <= cp <= 0x309F:
+            return True
+        # Katakana
+        if (0x30A0 <= cp <= 0x30FF) or (0x31F0 <= cp <= 0x31FF):
+            return True
+        # Hangul
+        if (0x1100 <= cp <= 0x11FF) or (0x3130 <= cp <= 0x318F) or (0xAC00 <= cp <= 0xD7AF):
+            return True
+        return False
+
+    def _is_word_char(ch: str) -> bool:
+        # Letters (L*) and Numbers (N*) count as word chars here.
+        cat = unicodedata.category(ch)
+        return cat and (cat[0] in ("L", "N"))
+
+    tokens: list[str] = []
+    buf: list[str] = []
+
+    def _flush_buf():
+        if buf:
+            tokens.append("".join(buf))
+            buf.clear()
+
+    for ch in t:
+        if ch.isspace():
+            _flush_buf()
+            continue
+        if _is_cjk_char(ch):
+            _flush_buf()
+            tokens.append(ch)
+        else:
+            if _is_word_char(ch):
+                buf.append(ch)
+            else:
+                # Any leftover symbol/punct should have been removed already if strip_punct=True.
+                # If strip_punct=False, we drop them from tokens anyway to keep metrics consistent.
+                # You can change this behavior if needed.
+                _flush_buf()
+
+    _flush_buf()
+
+    if collapse_whitespace:
+        # No-op for token list; but keep semantics consistent with previous code path.
+        pass
+
+    return tokens
+
 # -------------------------- Recall@k --------------------------
 
 class RecallAtK(Metric):
@@ -390,17 +512,21 @@ class ExactMatch(Metric):
     # ------------------------ helpers ------------------------
 
     def _normalize(self, s: str) -> str:
-        import re, string
-        t = s or ""
-        if self.lowercase:
-            t = t.lower()
-        if self.strip_punct:
-            keep = "".join(ch for ch in t if ch not in string.punctuation)
-            t = keep
+        """
+        Unicode-aware normalization suitable for multilingual (incl. CJK).
+        Keeps the same flags semantics as before, but uses Unicode-safe routines.
+        """
+        t = _unicode_normalize(s or "", lowercase=self.lowercase)
+
         if self.extra_strip_chars:
             t = t.translate(str.maketrans("", "", self.extra_strip_chars))
+
         if self.remove_articles:
-            t = re.sub(r"\b(a|an|the)\b", " ", t)
+            t = _remove_articles_en(t)  # English-only
+
+        if self.strip_punct:
+            t = _strip_unicode_punct(t)
+
         if self.collapse_whitespace:
             t = " ".join(t.split())
         return t
@@ -484,20 +610,14 @@ class F1Score(Metric):
     # ------------------------ helpers ------------------------
 
     def _tokenize(self, s: str) -> List[str]:
-        import re, string, unicodedata
-        t = s or ""
-        t = unicodedata.normalize("NFKC", t)
-        if self.lowercase:
-            t = t.lower()
-        if self.strip_punct:
-            t = "".join(ch for ch in t if ch not in string.punctuation)
-        if self.extra_strip_chars:
-            t = t.translate(str.maketrans("", "", self.extra_strip_chars))
-        if self.remove_articles:
-            t = re.sub(r"\b(a|an|the)\b", " ", t)
-        if self.collapse_whitespace:
-            t = " ".join(t.split())
-        return t.split() if t else []
+        return _cjk_aware_tokenize(
+            s,
+            lowercase=self.lowercase,
+            strip_punct=self.strip_punct,
+            collapse_whitespace=self.collapse_whitespace,
+            remove_articles=self.remove_articles,
+            extra_strip_chars=self.extra_strip_chars,
+        )
 
     def _prf1(self, pred_toks: List[str], gold_toks: List[str]) -> Tuple[float, float, float]:
         from collections import Counter
@@ -612,20 +732,14 @@ class RougeN(Metric):
     # ------------------------ helpers ------------------------
 
     def _tokenize(self, s: str) -> List[str]:
-        import re, string, unicodedata
-        t = s or ""
-        t = unicodedata.normalize("NFKC", t)
-        if self.lowercase:
-            t = t.lower()
-        if self.strip_punct:
-            t = "".join(ch for ch in t if ch not in string.punctuation)
-        if self.extra_strip_chars:
-            t = t.translate(str.maketrans("", "", self.extra_strip_chars))
-        if self.remove_articles:
-            t = re.sub(r"\b(a|an|the)\b", " ", t)
-        if self.collapse_whitespace:
-            t = " ".join(t.split())
-        return t.split() if t else []
+        return _cjk_aware_tokenize(
+            s,
+            lowercase=self.lowercase,
+            strip_punct=self.strip_punct,
+            collapse_whitespace=self.collapse_whitespace,
+            remove_articles=self.remove_articles,
+            extra_strip_chars=self.extra_strip_chars,
+        )
 
     def _ngram_counts(self, toks: List[str], n: int) -> Dict[Tuple[str, ...], int]:
         from collections import Counter
@@ -735,20 +849,14 @@ class RougeL(Metric):
     # ------------------------ helpers ------------------------
 
     def _tokenize(self, s: str) -> List[str]:
-        import re, string, unicodedata
-        t = s or ""
-        t = unicodedata.normalize("NFKC", t)
-        if self.lowercase:
-            t = t.lower()
-        if self.strip_punct:
-            t = "".join(ch for ch in t if ch not in string.punctuation)
-        if self.extra_strip_chars:
-            t = t.translate(str.maketrans("", "", self.extra_strip_chars))
-        if self.remove_articles:
-            t = re.sub(r"\b(a|an|the)\b", " ", t)
-        if self.collapse_whitespace:
-            t = " ".join(t.split())
-        return t.split() if t else []
+        return _cjk_aware_tokenize(
+            s,
+            lowercase=self.lowercase,
+            strip_punct=self.strip_punct,
+            collapse_whitespace=self.collapse_whitespace,
+            remove_articles=self.remove_articles,
+            extra_strip_chars=self.extra_strip_chars,
+        )
 
     def _lcs_prf1(self, pred_toks: List[str], gold_toks: List[str]) -> Tuple[float, float, float]:
         # LCS length
@@ -922,20 +1030,14 @@ class BLEU(Metric):
     # ------------------------ helpers ------------------------
 
     def _tokenize(self, s: str) -> List[str]:
-        import re, string, unicodedata
-        t = s or ""
-        t = unicodedata.normalize("NFKC", t)
-        if self.lowercase:
-            t = t.lower()
-        if self.strip_punct:
-            t = "".join(ch for ch in t if ch not in string.punctuation)
-        if self.extra_strip_chars:
-            t = t.translate(str.maketrans("", "", self.extra_strip_chars))
-        if self.remove_articles:
-            t = re.sub(r"\b(a|an|the)\b", " ", t)
-        if self.collapse_whitespace:
-            t = " ".join(t.split())
-        return t.split() if t else []
+        return _cjk_aware_tokenize(
+            s,
+            lowercase=self.lowercase,
+            strip_punct=self.strip_punct,
+            collapse_whitespace=self.collapse_whitespace,
+            remove_articles=self.remove_articles,
+            extra_strip_chars=self.extra_strip_chars,
+        )
 
     def _ngram_counts(self, toks: List[str], n: int) -> Dict[Tuple[str, ...], int]:
         from collections import Counter
@@ -2327,7 +2429,7 @@ class CitationAccuracy(Metric):
                 if not p:
                     continue
                 # keep only reasonable tokens (alnum + _ -)
-                if re.fullmatch(r"[A-Za-z0-9_\-]+", p):
+                if re.fullmatch(r"[\w\-]+", p, flags=re.UNICODE):
                     tokens.append(p)
         return tokens
 
@@ -2405,8 +2507,8 @@ class EvidenceDensity(Metric):
     Returns:
       {
         key: float in [0,1] or None,
-        "evid_density_matched": int,  # matched answer n-grams
-        "evid_density_total": int     # total answer n-grams
+        f"{key}__matched": int,  # matched answer n-grams
+        f"{key}__total": int     # total answer n-grams
       }
       If no evidence texts or no answer n-grams (e.g., empty answer), returns None and counts.
     """
@@ -2449,20 +2551,20 @@ class EvidenceDensity(Metric):
         self.remove_articles = remove_articles
         self.extra_strip_chars = extra_strip_chars
 
-    # ------------------------------ main ------------------------------
-
     def compute(self, sample: Dict[str, Any]) -> Dict[str, Any]:
+        key = self._key()
+
         answer = sample.get("answer") or ""
         ans_tokens = self._tokenize(answer)
         ans_ngrams = self._ngrams(ans_tokens, self.n)
         total = len(ans_ngrams)
 
         if total == 0:
-            return {self._key(): None, "evid_density_matched": 0, "evid_density_total": 0}
+            return {key: None, f"{key}__matched": 0, f"{key}__total": 0}
 
         evid_texts = self._collect_evidence_texts(sample)
         if not evid_texts:
-            return {self._key(): None, "evid_density_matched": 0, "evid_density_total": total}
+            return {key: None, f"{key}__matched": 0, f"{key}__total": total}
 
         # build evidence n-gram set
         evid_set: set[tuple[str, ...]] = set()
@@ -2471,11 +2573,11 @@ class EvidenceDensity(Metric):
             evid_set.update(self._ngrams(toks, self.n))
 
         if not evid_set:
-            return {self._key(): None, "evid_density_matched": 0, "evid_density_total": total}
+            return {key: None, f"{key}__matched": 0, f"{key}__total": total}
 
         matched = sum(1 for g in ans_ngrams if g in evid_set)
         density = matched / max(1, total)
-        return {self._key(): float(density), "evid_density_matched": matched, "evid_density_total": total}
+        return {key: float(density), f"{key}__matched": matched, f"{key}__total": total}
 
     # ------------------------------ helpers ------------------------------
 
@@ -2527,20 +2629,14 @@ class EvidenceDensity(Metric):
         return evs
 
     def _tokenize(self, s: str) -> List[str]:
-        import re, string, unicodedata
-        t = s or ""
-        t = unicodedata.normalize("NFKC", t)
-        if self.lowercase:
-            t = t.lower()
-        if self.strip_punct:
-            t = "".join(ch for ch in t if ch not in string.punctuation)
-        if self.extra_strip_chars:
-            t = t.translate(str.maketrans("", "", self.extra_strip_chars))
-        if self.remove_articles:
-            t = re.sub(r"\b(a|an|the)\b", " ", t)
-        if self.collapse_whitespace:
-            t = " ".join(t.split())
-        return t.split() if t else []
+        return _cjk_aware_tokenize(
+            s,
+            lowercase=self.lowercase,
+            strip_punct=self.strip_punct,
+            collapse_whitespace=self.collapse_whitespace,
+            remove_articles=self.remove_articles,
+            extra_strip_chars=self.extra_strip_chars,
+        )
 
     @staticmethod
     def _ngrams(tokens: List[str], n: int) -> List[Tuple[str, ...]]:
