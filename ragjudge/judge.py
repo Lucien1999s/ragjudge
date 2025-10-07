@@ -1,21 +1,66 @@
-# judge.py
 from __future__ import annotations
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional, Union
 import unicodedata
 from collections import Counter
 
+
 class LLMJudge:
     """
-    Minimal judge (multilingual):
-      - With reference(s): token-level F1 (0~1). Supports str or list/tuple of str.
-      - No reference: return None.
+    Minimal multilingual judge for reference-based answer evaluation.
+
+    This class provides a lightweight F1-based comparison between a model's
+    generated answer and one or more reference answers. It supports multilingual
+    (CJK-aware) tokenization and can be used as a baseline scoring component
+    for RAG or QA systems.
+
+    Design
+    -------
+    - With reference(s): computes token-level precision, recall, and F1, selecting
+      the best reference (max F1). Supports a single string or a list/tuple of strings.
+    - Without reference: returns None with `judge_mode="noref"`.
+    - Tokenization: Unicode-normalized, CJK-aware; configurable lowercase and
+      punctuation stripping.
+
+    Parameters
+    ----------
+    lowercase : bool, default True
+        Whether to lowercase (casefold) text before tokenization.
+    strip_punct : bool, default True
+        Whether to strip punctuation and symbol characters before tokenization.
+
+    Returns (from `grade`)
+    -----------------------
+    Dict[str, Any] containing:
+        - judge_score : Optional[float]
+            F1 score between 0 and 1, or None if no valid reference.
+        - judge_mode : str
+            `"ref"` if reference(s) were provided, `"noref"` otherwise.
+        - judge_precision : float
+            Token-level precision against the best-matching reference.
+        - judge_recall : float
+            Token-level recall against the best-matching reference.
+        - judge_ref_match : Optional[str]
+            The reference string that yielded the highest F1.
+        - judge_note : Optional[str]
+            Optional message when no valid reference was found.
+
+    Notes
+    -----
+    - Deterministic (no randomness).
+    - Linear time O(|answer| + Σ|references|).
     """
 
     def __init__(self, *, lowercase: bool = True, strip_punct: bool = True) -> None:
         self.lowercase = lowercase
         self.strip_punct = strip_punct
 
-    def grade(self, question: str, answer: str, reference=None) -> Dict[str, Any]:
+    def grade(
+        self,
+        question: str,
+        answer: str,
+        reference: Optional[Union[str, List[str], Tuple[str, ...]]] = None,
+    ) -> Dict[str, Any]:
+        """Compute the token-level F1 between `answer` and `reference`."""
         if reference is None:
             return {"judge_score": None, "judge_mode": "noref"}
 
@@ -26,7 +71,11 @@ class LLMJudge:
             refs = [reference]
 
         if not refs:
-            return {"judge_score": None, "judge_mode": "ref", "judge_note": "no valid reference strings"}
+            return {
+                "judge_score": None,
+                "judge_mode": "ref",
+                "judge_note": "no valid reference strings",
+            }
 
         best = {"f1": -1.0, "p": 0.0, "r": 0.0, "ref": None}
         for ref in refs:
@@ -45,6 +94,7 @@ class LLMJudge:
     # ------------------------ helpers ------------------------
 
     def _tokenize(self, text: Any) -> List[str]:
+        """CJK-aware tokenization with optional normalization and punctuation stripping."""
         t = "" if text is None else (text if isinstance(text, str) else str(text))
         return _cjk_aware_tokenize_local(
             t,
@@ -54,6 +104,7 @@ class LLMJudge:
         )
 
     def _token_f1(self, pred: str, gold: str) -> Tuple[float, float, float]:
+        """Compute token-level precision, recall, and F1 between two strings."""
         pc, gc = Counter(self._tokenize(pred)), Counter(self._tokenize(gold))
         if not pc and not gc:
             return 1.0, 1.0, 1.0
@@ -73,35 +124,55 @@ def _cjk_aware_tokenize_local(
     strip_punct: bool = True,
     collapse_whitespace: bool = True,
 ) -> List[str]:
-    # 基於你 metrics 裡的想法的輕量本地版本
+    """
+    Lightweight, dependency-free tokenizer that handles mixed CJK/non-CJK text.
+
+    Features
+    --------
+    - Unicode NFKC normalization.
+    - Optional lowercase (casefold) and punctuation stripping.
+    - Splits CJK characters as individual tokens.
+    - Groups consecutive Latin letters or digits as tokens.
+    - Whitespace collapses into single boundaries.
+    """
+
     def _unicode_normalize(s: str) -> str:
         t = unicodedata.normalize("NFKC", s or "")
         return t.casefold() if lowercase else t
 
     def _strip_unicode_punct(s: str) -> str:
-        return "".join(ch for ch in s if (unicodedata.category(ch)[0] not in ("P", "S")))
+        return "".join(ch for ch in s if unicodedata.category(ch)[0] not in ("P", "S"))
 
     def _is_cjk(ch: str) -> bool:
         cp = ord(ch)
         return (
-            (0x4E00 <= cp <= 0x9FFF) or (0x3400 <= cp <= 0x4DBF) or
-            (0x20000 <= cp <= 0x2A6DF) or (0x2A700 <= cp <= 0x2B73F) or
-            (0x2B740 <= cp <= 0x2B81F) or (0x2B820 <= cp <= 0x2CEAF) or
-            (0xF900 <= cp <= 0xFAFF) or
-            (0x3040 <= cp <= 0x309F) or (0x30A0 <= cp <= 0x30FF) or (0x31F0 <= cp <= 0x31FF) or
-            (0x1100 <= cp <= 0x11FF) or (0x3130 <= cp <= 0x318F) or (0xAC00 <= cp <= 0xD7AF)
+            (0x4E00 <= cp <= 0x9FFF)
+            or (0x3400 <= cp <= 0x4DBF)
+            or (0x20000 <= cp <= 0x2A6DF)
+            or (0x2A700 <= cp <= 0x2B73F)
+            or (0x2B740 <= cp <= 0x2B81F)
+            or (0x2B820 <= cp <= 0x2CEAF)
+            or (0xF900 <= cp <= 0xFAFF)
+            or (0x3040 <= cp <= 0x309F)
+            or (0x30A0 <= cp <= 0x30FF)
+            or (0x31F0 <= cp <= 0x31FF)
+            or (0x1100 <= cp <= 0x11FF)
+            or (0x3130 <= cp <= 0x318F)
+            or (0xAC00 <= cp <= 0xD7AF)
         )
 
     def _is_word_char(ch: str) -> bool:
         cat = unicodedata.category(ch)
-        return cat and (cat[0] in ("L", "N"))
+        return cat and cat[0] in ("L", "N")
 
     t = _unicode_normalize(text)
     if strip_punct:
         t = _strip_unicode_punct(t)
 
-    tokens, buf = [], []
-    def flush():
+    tokens: List[str] = []
+    buf: List[str] = []
+
+    def flush() -> None:
         if buf:
             tokens.append("".join(buf))
             buf.clear()
@@ -113,12 +184,10 @@ def _cjk_aware_tokenize_local(
         if _is_cjk(ch):
             flush()
             tokens.append(ch)
+        elif _is_word_char(ch):
+            buf.append(ch)
         else:
-            if _is_word_char(ch):
-                buf.append(ch)
-            else:
-                flush()
+            flush()
+
     flush()
-    if collapse_whitespace:
-        pass
     return tokens
